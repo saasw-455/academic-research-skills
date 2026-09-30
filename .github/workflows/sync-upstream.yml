@@ -4,6 +4,9 @@ name: Sync with upstream
 # 用 merge 而非 force，保留本 fork 独有的提交。
 # 冲突一律以上游为准（-X theirs）。
 # GITHUB_TOKEN 不允许推送 .github/workflows 的改动，因此同步时保留 fork 自己的 workflows。
+# Claude 插件同步打包时会丢弃符号链接，而上游的 skills/ 全是指向根目录的符号链接，
+# 导致 4 个核心 skill 装进 Claude 后不见了。因此每次运行都把 skills/ 里的符号链接
+# 展开成真实目录（内容取自上游对应的根目录），保证 skills/ 始终与上游一致。
 on:
   schedule:
     - cron: '10 0 * * 1'
@@ -20,22 +23,80 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Merge upstream/main
+      - name: Merge upstream/main and materialize skills/
         run: |
+          set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/Imbad0202/academic-research-skills.git
           git fetch upstream main
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "already up to date"; exit 0
-          fi
           BEFORE=$(git rev-parse HEAD)
-          git merge --no-commit --no-ff -X theirs upstream/main || true
-          if git ls-files -u | grep -q .; then
-            echo "unresolved conflicts:"; git ls-files -u; exit 1
+
+          MERGING=0
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "already up to date with upstream"
+          else
+            MERGING=1
+            git merge --no-commit --no-ff -X theirs upstream/main || true
+            # skills/ 会在下面整体重建，这里的冲突（符号链接 vs 目录）直接丢弃
+            if git ls-files -u -- skills | grep -q .; then
+              echo "dropping conflicted skills/ entries (rebuilt below)"
+              git rm -r -q -f --cached -- skills || true
+              rm -rf skills
+            fi
+            if git ls-files -u | grep -q .; then
+              echo "unresolved conflicts:"; git ls-files -u; exit 1
+            fi
+            rm -rf .github/workflows
+            git checkout "$BEFORE" -- .github/workflows
+            git add -A .github/workflows
           fi
-          rm -rf .github/workflows
-          git checkout "$BEFORE" -- .github/workflows
-          git add -A .github/workflows
-          git commit --no-edit
-          git push origin HEAD:main
+
+          # 按上游 skills/ 的符号链接清单，把每个链接展开成真实目录
+          mkdir -p skills
+          WANT=""
+          LINKED=""
+          while read -r mode type sha path; do
+            name=${path#skills/}
+            WANT="$WANT $name"
+            if [ "$mode" = "120000" ]; then
+              LINKED="$LINKED $name"
+              target=$(git cat-file blob "$sha")
+              src=$(realpath -m --relative-to=. "skills/$target")
+              if [ ! -f "$src/SKILL.md" ]; then
+                echo "::error::skills/$name -> $target: $src/SKILL.md not found"; exit 1
+              fi
+              rm -rf "skills/$name"
+              cp -RL "$src" "skills/$name"
+              echo "materialized skills/$name <- $src"
+            else
+              rm -rf "skills/$name"
+              git checkout upstream/main -- "skills/$name"
+            fi
+          done < <(git ls-tree upstream/main skills/)
+          # 删除上游已经不存在的 skills/ 条目
+          for d in skills/*; do
+            [ -e "$d" ] || [ -L "$d" ] || continue
+            case " $WANT " in *" ${d#skills/} "*) ;; *) echo "removing stale $d"; rm -rf "$d";; esac
+          done
+          git add -A skills
+
+          # 自检：skills/ 里不能再有符号链接，且每个 skill 都有 SKILL.md
+          if git ls-files -s skills | awk '$1=="120000"' | grep -q .; then
+            echo "::error::symlinks still present in skills/"; exit 1
+          fi
+          for name in $LINKED; do
+            test -f "skills/$name/SKILL.md" || { echo "::error::skills/$name/SKILL.md missing"; exit 1; }
+          done
+
+          if [ "$MERGING" = 1 ]; then
+            git commit --no-edit
+          elif ! git diff --cached --quiet; then
+            git commit -m "fork: materialize skills/ symlinks for Claude plugin sync"
+          fi
+
+          if [ "$(git rev-parse HEAD)" != "$BEFORE" ]; then
+            git push origin HEAD:main
+          else
+            echo "nothing to push"
+          fi
