@@ -81,6 +81,41 @@ jobs:
           done
           git add -A skills
 
+          # 让 marketplace.json 声明的 skill 路径指向 skills/ 下的真实目录。
+          # Claude 插件打包只保留声明的路径、加载时只认 skills/，上游声明的是根目录路径，
+          # 两者对不上就会一个 skill 都加载不出来（nature-skills 用的就是 ./skills/<name>）。
+          # 每次都从上游版本重新生成，避免残留旧的改写
+          git checkout upstream/main -- .claude-plugin/marketplace.json
+          python3 - "$LINKED" <<'PY'
+          import json, sys
+          names = set(sys.argv[1].split())
+          p = ".claude-plugin/marketplace.json"
+          d = json.load(open(p, encoding="utf-8"))
+          for pl in d.get("plugins", []):
+              sk = pl.get("skills")
+              if isinstance(sk, str):
+                  sk = [sk]
+              if not sk:
+                  continue
+              new = []
+              for s in sk:
+                  base = s.rstrip("/").split("/")[-1]
+                  if base in names and not s.startswith("./skills/"):
+                      s = "./skills/" + base
+                  new.append(s)
+              pl["skills"] = new
+          with open(p, "w", encoding="utf-8") as f:
+              json.dump(d, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          for pl in d.get("plugins", []):
+              for s in pl.get("skills") or []:
+                  import os
+                  if not os.path.isfile(os.path.join(s, "SKILL.md")):
+                      sys.exit(f"::error::declared skill path {s} has no SKILL.md")
+          print("marketplace skills:", [pl.get("skills") for pl in d.get("plugins", [])])
+          PY
+          git add .claude-plugin/marketplace.json
+
           # 自检：skills/ 里不能再有符号链接，且每个 skill 都有 SKILL.md
           if git ls-files -s skills | awk '$1=="120000"' | grep -q .; then
             echo "::error::symlinks still present in skills/"; exit 1
